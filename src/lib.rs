@@ -123,15 +123,7 @@ impl State {
 
         surface.configure(&device, &config);
 
-        let mut image = Vec::<u8>::with_capacity((size.width * size.height * 4) as usize);
-        for y in 0..size.height {
-            for x in 0..size.width {
-                image.push((y % 255) as u8);
-                image.push((x % 255) as u8);
-                image.push(((x + y) % 255) as u8);
-                image.push(255);
-            }
-        }
+        let mut image = raytrace(size.width, size.height);
 
         let texture_size = wgpu::Extent3d {
             width: size.width,
@@ -371,6 +363,44 @@ impl State {
 
         Ok(())
     }
+}
+
+fn raytrace(width: u32, height: u32) -> Vec<u8> {
+    let mut image = Vec::<u8>::with_capacity((width * height * 4) as usize);
+
+    let l = 1.0;
+
+    for y in 0..height {
+        for x in 0..width {
+            let ax = 0.0;
+            let ay = 0.0;
+            let az = -5.0;
+
+            let bx = (x as f32 - width as f32 / 2.0) / height as f32;
+            let by = (height as f32 / 2.0 - y as f32) / height as f32;
+            let bz = l;
+
+            let x0 = 0.0;
+            let y0 = 0.0;
+            let z0 = 5.0;
+            let r = 2.0;
+
+            let hit = 4.0 * (ax * bx + ay * by + az * bz) * (ax * bx + ay * by + az * bz)
+                - 4.0 * (bx * bx + by * by + bz * bz) * (ax * ax + ay * ay + az * az - r * r);
+            if hit >= 0.0 {
+                image.push(255);
+                image.push(0);
+                image.push(0);
+                image.push(255);
+            } else {
+                image.push(255);
+                image.push(255);
+                image.push(0);
+                image.push(255);
+            }
+        }
+    }
+    image
 }
 
 pub async fn run() {
