@@ -1,3 +1,8 @@
+extern crate imgui_winit_support;
+
+//use imgui::*;
+//use imgui_wgpu::{Renderer, RendererConfig};
+
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
@@ -5,6 +10,11 @@ use winit::{
     window::Window,
     window::WindowBuilder,
 };
+
+pub trait Renderer {
+    fn render(&mut self, width: u32, height: u32) -> &Vec<u8>;
+    fn imgui_render(&mut self, ui: &imgui::Ui, width: u32, height: u32) -> bool;
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -70,14 +80,23 @@ struct State {
     index_buffer: wgpu::Buffer,
     num_indices: u32,
 
-    image: Vec<u8>,
     bind_group: wgpu::BindGroup,
     image_rendered: bool,
+
+    imgui: imgui::Context,
+    imgui_renderer: imgui_wgpu::Renderer,
+    platform: imgui_winit_support::WinitPlatform,
+
+    renderer: Box<dyn Renderer>,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    shader: wgpu::ShaderModule,
+    render_pipeline_layout: wgpu::PipelineLayout,
 }
 
 impl State {
     // Creating some of the wgpu types requires async code
-    async fn new(window: &Window) -> Self {
+    async fn new(window: &Window, mut renderer: Box<dyn Renderer>) -> Self {
         let size = window.inner_size();
 
         // The instance is a handle to our GPU
@@ -115,7 +134,7 @@ impl State {
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface.get_preferred_format(&adapter).unwrap(),
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
@@ -123,7 +142,265 @@ impl State {
 
         surface.configure(&device, &config);
 
-        let mut image = raytrace(size.width, size.height);
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("texture_bind_group_layout"),
+            });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Pipeline"),
+                bind_group_layouts: &[&texture_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let (render_pipeline, bind_group) = Self::render_image(
+            &mut renderer,
+            &size,
+            &device,
+            &queue,
+            &texture_bind_group_layout,
+            &sampler,
+            &render_pipeline_layout,
+            &shader,
+            &config,
+        );
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let num_vertices = VERTICES.len() as u32;
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let num_indices = INDICES.len() as u32;
+
+        // Set up dear imgui
+        let mut imgui = imgui::Context::create();
+        let mut platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
+        platform.attach_window(
+            imgui.io_mut(),
+            &window,
+            imgui_winit_support::HiDpiMode::Default,
+        );
+        imgui.set_ini_filename(None);
+
+        let hidpi_factor = window.scale_factor();
+        let font_size = (13.0 * hidpi_factor) as f32;
+        imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
+
+        imgui
+            .fonts()
+            .add_font(&[imgui::FontSource::DefaultFontData {
+                config: Some(imgui::FontConfig {
+                    oversample_h: 1,
+                    pixel_snap_h: true,
+                    size_pixels: font_size,
+                    ..Default::default()
+                }),
+            }]);
+
+        //
+        // Set up dear imgui wgpu renderer
+        //
+
+        let renderer_config = imgui_wgpu::RendererConfig {
+            texture_format: config.format,
+            ..Default::default()
+        };
+
+        let imgui_renderer =
+            imgui_wgpu::Renderer::new(&mut imgui, &device, &queue, renderer_config);
+
+        Self {
+            surface,
+            device,
+            queue,
+            config,
+            size,
+            render_pipeline,
+            vertex_buffer,
+            num_vertices,
+            index_buffer,
+            num_indices,
+            bind_group,
+            image_rendered: true,
+            imgui,
+            imgui_renderer,
+            platform,
+            renderer,
+            texture_bind_group_layout,
+            sampler,
+            shader,
+            render_pipeline_layout,
+        }
+    }
+
+    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if self.size != new_size {
+            self.image_rendered = false;
+        }
+        if new_size.width > 0 && new_size.height > 0 {
+            self.size = new_size;
+            self.config.width = new_size.width;
+            self.config.height = new_size.height;
+            self.surface.configure(&self.device, &self.config);
+        }
+    }
+
+    fn input(&mut self, event: &WindowEvent, window: &Window, event_enum: &Event<()>) -> bool {
+        match event {
+            WindowEvent::KeyboardInput {
+                input:
+                    KeyboardInput {
+                        state: ElementState::Pressed,
+                        virtual_keycode: Some(VirtualKeyCode::R),
+                        ..
+                    },
+                ..
+            } => {
+                //self.image_rendered = true;
+                true
+            }
+            _ => {
+                self.platform
+                    .handle_event(self.imgui.io_mut(), window, event_enum);
+                false
+            }
+        }
+    }
+
+    fn update(&mut self) {}
+
+    fn render(&mut self, window: &Window) -> Result<(), wgpu::SurfaceError> {
+        let output = self.surface.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        self.platform
+            .prepare_frame(self.imgui.io_mut(), &window)
+            .unwrap();
+        let ui = self.imgui.frame();
+
+        if self
+            .renderer
+            .imgui_render(&ui, self.size.width, self.size.height)
+        {
+            (self.render_pipeline, self.bind_group) = Self::render_image(
+                &mut self.renderer,
+                &self.size,
+                &self.device,
+                &self.queue,
+                &self.texture_bind_group_layout,
+                &self.sampler,
+                &self.render_pipeline_layout,
+                &self.shader,
+                &self.config,
+            );
+            self.image_rendered = true;
+        }
+
+        self.platform.prepare_render(&ui, window);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            if self.image_rendered {
+                render_pass.set_bind_group(0, &self.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            }
+
+            self.imgui_renderer
+                .render(ui.render(), &self.queue, &self.device, &mut render_pass)
+                .unwrap();
+        }
+
+        // submit will accept anything that implements IntoIter
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        Ok(())
+    }
+
+    fn render_image(
+        renderer: &mut Box<dyn Renderer>,
+        size: &winit::dpi::PhysicalSize<u32>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture_bind_group_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        render_pipeline_layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
+        let image = renderer.render(size.width, size.height);
 
         let texture_size = wgpu::Extent3d {
             width: size.width,
@@ -158,38 +435,6 @@ impl State {
         );
 
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-                label: Some("texture_bind_group_layout"),
-            });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
@@ -206,18 +451,6 @@ impl State {
             label: Some("bind_group"),
         });
 
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Pipeline"),
-                bind_group_layouts: &[&texture_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&render_pipeline_layout),
@@ -229,11 +462,11 @@ impl State {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[wgpu::ColorTargetState {
+                targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
-                }],
+                })],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -252,208 +485,67 @@ impl State {
             },
             multiview: None,
         });
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let num_vertices = VERTICES.len() as u32;
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        let num_indices = INDICES.len() as u32;
-
-        Self {
-            surface,
-            device,
-            queue,
-            config,
-            size,
-            render_pipeline,
-            vertex_buffer,
-            num_vertices,
-            index_buffer,
-            num_indices,
-            image,
-            bind_group,
-            image_rendered: true,
-        }
-    }
-
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if self.size != new_size {
-            self.image_rendered = false;
-        }
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-        }
-    }
-
-    fn input(&mut self, event: &WindowEvent) -> bool {
-        match event {
-            WindowEvent::KeyboardInput {
-                input:
-                    KeyboardInput {
-                        state: ElementState::Pressed,
-                        virtual_keycode: Some(VirtualKeyCode::R),
-                        ..
-                    },
-                ..
-            } => {
-                self.image_rendered = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn update(&mut self) {}
-
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: true,
-                    },
-                }],
-                depth_stencil_attachment: None,
-            });
-
-            render_pass.set_pipeline(&self.render_pipeline);
-            if self.image_rendered {
-                render_pass.set_bind_group(0, &self.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
-            }
-        }
-
-        // submit will accept anything that implements IntoIter
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
+        (render_pipeline, bind_group)
     }
 }
 
-fn raytrace(width: u32, height: u32) -> Vec<u8> {
-    let mut image = Vec::<u8>::with_capacity((width * height * 4) as usize);
-
-    let l = 1.0;
-
-    for y in 0..height {
-        for x in 0..width {
-            let ax = 0.0;
-            let ay = 0.0;
-            let az = -5.0;
-
-            let bx = (x as f32 - width as f32 / 2.0) / height as f32;
-            let by = (height as f32 / 2.0 - y as f32) / height as f32;
-            let bz = l;
-
-            let x0 = 0.0;
-            let y0 = 0.0;
-            let z0 = 5.0;
-            let r = 2.0;
-
-            let hit = 4.0 * (ax * bx + ay * by + az * bz) * (ax * bx + ay * by + az * bz)
-                - 4.0 * (bx * bx + by * by + bz * bz) * (ax * ax + ay * ay + az * az - r * r);
-            if hit >= 0.0 {
-                image.push(255);
-                image.push(0);
-                image.push(0);
-                image.push(255);
-            } else {
-                image.push(255);
-                image.push(255);
-                image.push(0);
-                image.push(255);
-            }
-        }
-    }
-    image
-}
-
-pub async fn run() {
+pub async fn run(renderer: Box<dyn Renderer>) {
     env_logger::init();
     let event_loop = EventLoop::new();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
+    let window = WindowBuilder::new()
+        .with_inner_size(winit::dpi::PhysicalSize::new(600, 400))
+        .build(&event_loop)
+        .unwrap();
 
-    let mut state = State::new(&window).await;
+    let mut state = State::new(&window, renderer).await;
 
-    event_loop.run(move |event, _, control_flow| match event {
-        Event::WindowEvent {
-            ref event,
-            window_id,
-        } if window_id == window.id() => {
-            if !state.input(event) {
-                match event {
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        input:
-                            KeyboardInput {
-                                state: ElementState::Pressed,
-                                virtual_keycode: Some(VirtualKeyCode::Escape),
-                                ..
-                            },
-                        ..
-                    } => *control_flow = ControlFlow::Exit,
-                    WindowEvent::Resized(physical_size) => {
-                        state.resize(*physical_size);
+    event_loop.run(move |event, _, control_flow| {
+        let event_enum = &event;
+        match event {
+            Event::WindowEvent {
+                ref event,
+                window_id,
+            } if window_id == window.id() => {
+                if !state.input(event, &window, event_enum) {
+                    match event {
+                        WindowEvent::CloseRequested
+                        | WindowEvent::KeyboardInput {
+                            input:
+                                KeyboardInput {
+                                    state: ElementState::Pressed,
+                                    virtual_keycode: Some(VirtualKeyCode::Escape),
+                                    ..
+                                },
+                            ..
+                        } => *control_flow = ControlFlow::Exit,
+                        WindowEvent::Resized(physical_size) => {
+                            state.resize(*physical_size);
+                        }
+                        WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                            state.resize(**new_inner_size);
+                        }
+                        _ => {}
                     }
-                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        state.resize(**new_inner_size);
-                    }
-                    _ => {}
                 }
             }
-        }
-        Event::RedrawRequested(window_id) if window_id == window.id() => {
-            state.update();
-            match state.render() {
-                Ok(_) => {}
-                // Reconfigure the surface if lost
-                Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                // The system is out of memory, we should probably quit
-                Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                // All other errors (Outdated, Timeout) should be resolved by the next frame
-                Err(e) => eprintln!("{:?}", e),
+            Event::RedrawRequested(window_id) if window_id == window.id() => {
+                state.update();
+                match state.render(&window) {
+                    Ok(_) => {}
+                    // Reconfigure the surface if lost
+                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                    // The system is out of memory, we should probably quit
+                    Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                    // All other errors (Outdated, Timeout) should be resolved by the next frame
+                    Err(e) => eprintln!("{:?}", e),
+                }
             }
+            Event::MainEventsCleared => {
+                // RedrawRequested will only trigger once, unless we manually
+                // request it.
+                window.request_redraw();
+            }
+            _ => {}
         }
-        Event::MainEventsCleared => {
-            // RedrawRequested will only trigger once, unless we manually
-            // request it.
-            window.request_redraw();
-        }
-        _ => {}
     });
 }
